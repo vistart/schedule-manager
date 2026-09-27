@@ -36,6 +36,7 @@ dev = [
 [project.scripts]
 schedule-manager = "schedule_manager.cli:main"
 schedule-manager-setup-db = "schedule_manager.setup_db:main"
+schedule-manager-mcp = "schedule_manager.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

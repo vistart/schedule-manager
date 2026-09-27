@@ -17,6 +17,7 @@ from rhosocial.activerecord.backend.impl.postgres import AsyncPostgresBackend
 
 from schedule_manager.config import get_db_config
 from schedule_manager.model import Schedule
+from schedule_manager.schema import create_table, drop_table
 
 VENV_PYTHON = sys.executable
 
@@ -25,13 +26,10 @@ VENV_PYTHON = sys.executable
 async def setup_db():
     config = get_db_config()
     await Schedule.configure(config, AsyncPostgresBackend)
-    expr = Schedule.generate_create_table(if_not_exists=True)
-    sql, params = expr.to_sql()
-    await Schedule.backend().execute(sql, params)
+    backend = Schedule.backend()
+    await create_table(backend)
     yield
-    expr = Schedule.generate_drop_table(if_exists=True)
-    sql, params = expr.to_sql()
-    await Schedule.backend().execute(sql, params)
+    await drop_table(backend)
 
 
 # ── CRUD Tests ──────────────────────────────────────────────────────────────

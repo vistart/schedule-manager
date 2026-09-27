@@ -8,15 +8,14 @@ from rhosocial.activerecord.backend.impl.postgres import AsyncPostgresBackend
 
 from .config import get_db_config
 from .model import Schedule
+from .schema import create_table
 
 
 async def _async_main() -> None:
     config = get_db_config()
     await Schedule.configure(config, AsyncPostgresBackend)
     backend = Schedule.backend()
-    expr = Schedule.generate_create_table(if_not_exists=True)
-    sql, params = expr.to_sql()
-    await backend.execute(sql, params)
+    await create_table(backend)
     print(f"Table 'schedules' ensured in database '{config.database}'.")
     await backend.disconnect()
 

@@ -21,6 +21,9 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+> 若要用本地编辑模式装 `rhosocial-activerecord` / `rhosocial-activerecord-postgres`、
+> 单独配 pip 源，或接入 opencode，见 [接入 opencode](#接入-opencode) 的完整步骤。
+
 ## 配置
 
 复制 `.env.example` 为 `.env`，填入数据库连接信息：
@@ -174,25 +177,148 @@ schedule-manager search --keyword deadline
 
 ## MCP Server
 
-通过 `mcp` CLI 启动：
+启动（stdio）：
 
 ```bash
-mcp run schedule_manager.mcp_server
+schedule-manager-mcp
 ```
 
-或在 MCP 客户端配置中添加：
+安装后提供的 `schedule-manager-mcp` 控制台入口会读取 `SCHEDULE_DB_*` 环境变量
+（缺省回退到项目根目录的 `.env`），并保证 `schedules` 表存在。
+
+### 接入 opencode
+
+opencode 通过原生 MCP 支持接入，配置放在项目根目录的 `opencode.json`。
+
+**步骤 1：装好虚拟环境与数据库**
+
+```bash
+cd /path/to/schedule-manager
+
+# 虚拟环境。--without-pip + --system-site-packages 与本项目现有环境一致，
+# pip 来自 ~/.local 的用户级 site-packages，因此没有 .venv*/bin/pip，
+# 一律用 `python -m pip` 调用。
+python3 -m venv --without-pip --system-site-packages .venv3.14-ubuntu26.04
+
+# 可选：给该虚拟环境单独配 pip 源（放在 venv 根目录，pip 会按 site 级自动读取，
+# 不影响其它项目和全局配置）
+cat > .venv3.14-ubuntu26.04/pip.conf <<'EOF'
+[global]
+index-url = https://mirrors.aliyun.com/pypi/simple/
+trusted-host = mirrors.aliyun.com
+timeout = 120
+EOF
+
+# 本地编辑模式安装两个 ORM 依赖（改动即时生效，无需重装）
+.venv3.14-ubuntu26.04/bin/python -m pip install -e /path/to/rhosocial/python-activerecord
+.venv3.14-ubuntu26.04/bin/python -m pip install -e /path/to/rhosocial/python-activerecord-postgres
+
+# 安装本项目，注册 schedule-manager / schedule-manager-setup-db / schedule-manager-mcp
+.venv3.14-ubuntu26.04/bin/python -m pip install -e ".[test]"
+```
+
+确认依赖确实指向本地源码树：
+
+```bash
+.venv3.14-ubuntu26.04/bin/python -m pip show rhosocial-activerecord | rg "Editable"
+```
+
+按 `.env.example` 建好 `.env` 并填入真实连接参数，然后建库建表
+（数据库本身不存在时需先 `CREATE DATABASE`）：
+
+```bash
+.venv3.14-ubuntu26.04/bin/schedule-manager-setup-db
+```
+
+**步骤 2：写 `opencode.json`**
+
+连接参数一律不落在仓库里，五个变量全部用 `{env:VAR}` 从启动 opencode 的 shell 读取：
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "schedule-manager": {
-      "command": "schedule-manager-mcp",
-      "args": []
+      "type": "local",
+      "command": [".venv3.14-ubuntu26.04/bin/schedule-manager-mcp"],
+      "cwd": ".",
+      "enabled": true,
+      "timeout": 120000,
+      "environment": {
+        "SCHEDULE_DB_HOST": "{env:SCHEDULE_DB_HOST}",
+        "SCHEDULE_DB_PORT": "{env:SCHEDULE_DB_PORT}",
+        "SCHEDULE_DB_NAME": "{env:SCHEDULE_DB_NAME}",
+        "SCHEDULE_DB_USER": "{env:SCHEDULE_DB_USER}",
+        "SCHEDULE_DB_PASSWORD": "{env:SCHEDULE_DB_PASSWORD}"
+      }
     }
   }
 }
 ```
 
+- `command` 用**相对路径**配合 `cwd`（相对路径按 workspace 解析），这样配置本身不含
+  本机绝对路径，可以直接提交共享。若把 `opencode.json` 放到别处或用全局配置，
+  改成绝对路径并去掉 `cwd`。
+- `timeout` 必调，原因见下方「两个容易踩的点」。
+
+**步骤 3：把 `.env` 导出到 shell**
+
+`.env` 本身已被 `.gitignore` 排除，唯一的连接信息来源。用 `set -a` 一次性导出其中
+所有变量，让 `{env:VAR}` 有值可取：
+
+```bash
+set -a; . ./.env; set +a
+```
+
+**步骤 4：验证连通性**
+
+```bash
+opencode mcp list
+```
+
+期望输出 `✓ schedule-manager connected`。若显示 `failed`，见下方排错。
+
+**步骤 5：重启 opencode**
+
+config 只在启动时加载，**必须退出并重启 opencode** 才生效；当前会话仍使用旧配置。
+
+之后即可用自然语言控制日程，例如「把下周一上午十点的团队站会建成日程，优先级 2」。
+
+#### 两个容易踩的点
+
+- **`timeout` 必须调大**。schema 里 `McpLocalConfig.timeout` 默认只有 5000ms，而本服务
+  导入依赖较重、冷启动约 15s，不改会直接超时。
+- **`.env` 不再兜底**。`load_dotenv(override=False)` 不会覆盖已存在的环境变量，所以
+  `environment` 里声明过的键，即使取到空值也不会再回退 `.env`；此时会抛出
+  `DatabaseError` 并指明缺失的变量名。这就是步骤 3 必须先执行的原因。
+
+#### 排错
+
+| 现象 | 原因与处理 |
+|------|-----------|
+| `MCP error -32000: Connection closed` | `environment` 里的变量取到空值，多半是漏了步骤 3。用 `opencode mcp list --print-logs` 看 stderr，或直接运行 `schedule-manager-mcp` 复现，会打印出缺失的变量名 |
+| `File not found: .../schedule_manager.mcp_server` | 用了 `mcp run <点号模块>`。mcp 2.x 的 `mcp run` 只接受文件路径，请改用 `schedule-manager-mcp` 控制台入口 |
+| 请求超时 | `timeout` 太小。冷启动约 15s，建议 ≥ 60000 |
+| `connection refused` | 端口不对或数据库不可达。`psql -h "$SCHEDULE_DB_HOST" -p "$SCHEDULE_DB_PORT" -U "$SCHEDULE_DB_USER" -l` 先确认连通 |
+
+#### 切换数据库
+
+改 `.env` 即可（每个 opencode 配置对应一个库，会话内固定）。需要按会话切库就得改成
+"命名 profile + 工具参数选库"的方案（当前未实现）。如果不想在 `opencode.json` 里
+出现 `environment` 块，把整个块删掉即可，服务会直接读 `.env`。
+
+### 接入其它 MCP 客户端
+
+```json
+{
+  "mcpServers": {
+    "schedule-manager": {
+      "command": "/abs/path/to/schedule-manager/.venv3.14-ubuntu26.04/bin/schedule-manager-mcp",
+      "args": []
+    }
+  }
+}
+```
 ### 工具列表
 
 | 工具 | 说明 |
@@ -226,9 +352,10 @@ pytest tests/ -v
 ```
 src/schedule_manager/
 ├── __init__.py
-├── config.py       # 数据库配置（从 .env 加载）
+├── config.py       # 数据库配置（环境变量优先，回退 .env）
 ├── model.py        # Schedule ActiveRecord 模型
-├── mcp_server.py   # FastMCP Server，7 个工具
+├── schema.py       # schedules 表 DDL（消费 DDLSource 声明）
+├── mcp_server.py   # MCP Server（MCPServer），7 个工具
 ├── cli.py          # CLI 入口，LLM 优化设计
 └── setup_db.py     # 数据库表初始化脚本
 ```

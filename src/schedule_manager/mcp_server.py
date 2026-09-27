@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+import sys
 from typing import AsyncIterator, Optional
 
 from dateutil.tz import tzutc
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from rhosocial.activerecord.backend.impl.postgres import AsyncPostgresBackend
 
 from .config import get_db_config
 from .model import Schedule
+from .schema import create_table
 
 
 def _schedule_to_dict(s: Schedule) -> dict:
@@ -37,17 +39,15 @@ def _schedule_to_dict(s: Schedule) -> dict:
 
 
 @asynccontextmanager
-async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
+async def lifespan(server: MCPServer) -> AsyncIterator[dict]:
     config = get_db_config()
     await Schedule.configure(config, AsyncPostgresBackend)
     backend = Schedule.backend()
-    expr = Schedule.generate_create_table(if_not_exists=True)
-    sql, params = expr.to_sql()
-    await backend.execute(sql, params)
+    await create_table(backend)
     yield {}
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "schedule-manager",
     instructions="Schedule management system. Create, read, update, delete, and search schedules with pagination, filtering, and sorting.",
     lifespan=lifespan,
@@ -253,3 +253,15 @@ async def search_schedules(keyword: str) -> dict:
     """
     items = await Schedule.search(keyword)
     return {"items": [_schedule_to_dict(s) for s in items], "total": len(items)}
+
+
+def main() -> None:
+    try:
+        mcp.run(transport="stdio")
+    except Exception as exc:
+        print(f"schedule-manager-mcp failed to start: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()

@@ -55,8 +55,9 @@ soft-delete filter.
 
 ## Forbidden Query Paths
 
-Do not read `schedules`, `users`, `api_tokens` or `api_token_scopes` through
-`CTEQuery`, `SetOperationQuery` or `backend.execute`. They bypass
+Do not read `sm_schedules`, `sm_users`, `sm_api_tokens` or
+`sm_api_token_scopes` through `CTEQuery`, `SetOperationQuery` or
+`backend.execute`. They bypass
 `Model.query()` and are the only route that can miss the user filter. Raw SQL
 does not appear in application code at all: the schema is assembled in
 `schema/`, and no query is written by hand anywhere in `src/`.

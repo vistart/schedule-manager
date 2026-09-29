@@ -194,7 +194,7 @@ def cmd_reset(args) -> int:
 # ── probe ───────────────────────────────────────────────────────────────────
 
 #: Counted per statement, not filtered by table: authentication traffic is the
-#: thing being measured here, and it lives in api_tokens / users, so a
+#: thing being measured here, and it lives in sm_api_tokens / sm_users, so a
 #: "WHERE query ILIKE '%schedule%'" filter would drop most of the bill.
 _BEFORE = "SELECT calls, query FROM pg_stat_statements"
 

@@ -45,7 +45,20 @@ def column(
     """Build one ``ColumnDefinition``.
 
     ``references`` is ``(table, column)``; combined with ``on_delete`` it emits
-    a column-level ``FOREIGN KEY``.
+    a     column-level ``FOREIGN KEY``.
+
+    ``PRIMARY KEY`` and ``FOREIGN KEY`` are emitted *bare*, so the names gathered
+    for them here never reach the SQL — PostgreSQL picks ``<table>_<column>_pkey``
+    and ``_fkey``, which are unique because the table name is.  The names are still
+    set, since that is the shape the ORM's own DDL declarations use, but they are
+    built from the *column* name and are only accidentally unique: four tables in
+    this schema each carry a ``user_id``, so a formatter that began honouring them
+    would collide on ``fk_user_id`` before ``create_all`` finished.
+
+    So nothing here may rely on a constraint name.  A name that has to be unique
+    belongs in ``table_constraints`` with a name derived from the table, as
+    ``schema/tokens.py`` does for its composite primary key — which is exactly the
+    distinction that renaming a table exposed.
     """
     constraints: list[ColumnConstraint] = []
     if primary_key:

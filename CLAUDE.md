@@ -49,11 +49,12 @@ cross-user data leak.
    cross-user reads. Exposing them as tools would be a full user dump. The same
    applies to `Schedule.unscoped()`.
 
-3. **Do not query `schedules`, `users`, `api_tokens` or `api_token_scopes` with
-   `CTEQuery`, `SetOperationQuery` or `backend.execute`.** Those bypass
-   `Model.query()` and are the only path that can miss the user filter. There is
-   no hand-written SQL in the application at all — the schema is assembled in
-   `schema/` — so this rule has nothing to route around.
+3. **Do not query `sm_schedules`, `sm_users`, `sm_api_tokens` or
+   `sm_api_token_scopes` with `CTEQuery`, `SetOperationQuery` or
+   `backend.execute`.** Those bypass `Model.query()` and are the only path that
+   can miss the user filter. There is no hand-written SQL in the application at
+   all — the schema is assembled in `schema/` — so this rule has nothing to route
+   around.
 
 4. **Scopes are enforced per tool, not globally.** `AuthSettings.required_scopes`
    is deliberately empty — the SDK's requirement is all-or-nothing, which would
@@ -63,9 +64,10 @@ cross-user data leak.
    A token that cannot be resolved is passed through untouched so the SDK owns
    every 401. The scope vocabulary is defined **once**, in `models/user.py`.
 
-5. **`api_tokens` stores only a SHA-256 digest.** There is no plaintext column
-   and none may be added. Tokens are 256-bit random secrets, so a slow password
-   hash buys nothing; if a token is ever given a low entropy, revisit that.
+5. **`sm_api_tokens` stores only a SHA-256 digest.** There is no plaintext
+   column and none may be added. Tokens are 256-bit random secrets, so a slow
+   password hash buys nothing; if a token is ever given a low entropy, revisit
+   that.
 
 6. **Use `db.create_pool()` and `db.connection()`, not `Model.configure()`.**
    `Model.configure()` is per-class and opens a separate connection for each
@@ -84,6 +86,15 @@ cross-user data leak.
 8. **Tokens are opaque, not JWT.** They are bound to this service by
    construction, so there is no `aud` confusion to guard against, and revocation
    is immediate. There is no client-supplied identity assertion to validate.
+
+9. **Every table is prefixed `sm_`.** The database may be shared with other
+   services, and `users` / `schedules` are names another service will also want.
+   A table name is declared once, on the model (`__table_name__`); `schema/`
+   reads it back with `Model.table_name()` rather than repeating the string, and
+   index names are derived from the table name for the same reason — PostgreSQL
+   puts every index in one namespace, so a colliding index name takes down the
+   whole `create_all`. Adding a table without the prefix is a cross-service
+   outage waiting for someone else's deploy.
 
 ## Rules
 

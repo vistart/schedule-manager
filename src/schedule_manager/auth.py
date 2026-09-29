@@ -106,7 +106,7 @@ def _constant_time_equals(a: str, b: str) -> bool:
 
 
 class TokenTableVerifier(TokenVerifier):
-    """Resolves a bearer token against the ``api_tokens`` table."""
+    """Resolves a bearer token against the ``sm_api_tokens`` table."""
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         record = take_resolved(token)
         if record is None:

@@ -65,7 +65,7 @@ class TestGeneratedSQL:
         with as_user(7):
             sql = Schedule.query().to_sql()[0]
         assert '"user_id" = %s' in sql
-        assert "schedules" in sql
+        assert '"sm_schedules"' in sql
 
     def test_unscoped_drops_user_filter(self, offline_backend, as_user):
         with as_user(7):
@@ -76,7 +76,7 @@ class TestGeneratedSQL:
         with as_user(7):
             sql = User.query().to_sql()[0]
         assert "user_id" not in sql
-        assert "users" in sql
+        assert '"sm_users"' in sql
 
     def test_soft_delete_filter_survives_scoping(self, offline_backend, as_user):
         with as_user(7):
@@ -174,38 +174,46 @@ class TestDDL:
         ]
 
     def test_four_tables_in_dependency_order(self, offline_backend):
-        tables = [
-            t for t in self._sql(offline_backend)
-        ]
-        joined = " ".join(tables)
-        assert '"users"' in joined
-        assert '"api_tokens"' in joined
-        assert '"api_token_scopes"' in joined
-        assert '"schedules"' in joined
-        # users must be created before anything that references it
-        assert joined.index('"users"') < joined.index('"api_tokens"')
-        assert joined.index('"api_tokens"') < joined.index('"schedules"')
+        joined = " ".join(self._sql(offline_backend))
+        assert '"sm_users"' in joined
+        assert '"sm_api_tokens"' in joined
+        assert '"sm_api_token_scopes"' in joined
+        assert '"sm_schedules"' in joined
+        # sm_users must be created before anything that references it
+        assert joined.index('"sm_users"') < joined.index('"sm_api_tokens"')
+        assert joined.index('"sm_api_tokens"') < joined.index('"sm_schedules"')
+
+    def test_every_table_is_namespaced(self, offline_backend):
+        """The prefix is what keeps this out of another service's way.
+
+        Asserted explicitly because the failure is invisible until it happens:
+        a table created without the prefix works perfectly well right up until a
+        second service in the same database creates one with the same name.
+        """
+        for sql in self._sql(offline_backend):
+            table = sql.split("IF NOT EXISTS ", 1)[1].split(" ", 1)[0].strip('"')
+            assert table.startswith("sm_"), table
 
     def test_all_statements_are_idempotent(self, offline_backend):
         for sql in self._sql(offline_backend):
             assert "IF NOT EXISTS" in sql
 
     def test_schedules_user_id_is_restricted(self, offline_backend):
-        sql = [s for s in self._sql(offline_backend) if '"schedules"' in s][0]
-        assert 'REFERENCES "users"("id") ON DELETE RESTRICT' in sql
+        sql = [s for s in self._sql(offline_backend) if '"sm_schedules"' in s][0]
+        assert 'REFERENCES "sm_users"("id") ON DELETE RESTRICT' in sql
         assert '"user_id" INTEGER NOT NULL' in sql
 
     def test_token_scopes_cascade_but_token_user_restricts(self, offline_backend):
         sql = " ".join(self._sql(offline_backend))
-        assert 'REFERENCES "api_tokens"("id") ON DELETE CASCADE' in sql
-        assert 'REFERENCES "users"("id") ON DELETE RESTRICT' in sql
+        assert 'REFERENCES "sm_api_tokens"("id") ON DELETE CASCADE' in sql
+        assert 'REFERENCES "sm_users"("id") ON DELETE RESTRICT' in sql
 
     def test_scope_table_composite_primary_key(self, offline_backend):
-        sql = [s for s in self._sql(offline_backend) if '"api_token_scopes"' in s][0]
+        sql = [s for s in self._sql(offline_backend) if '"sm_api_token_scopes"' in s][0]
         assert 'PRIMARY KEY ("api_token_id", "scope")' in sql
 
     def test_token_digest_is_unique(self, offline_backend):
-        sql = [s for s in self._sql(offline_backend) if '"api_tokens"' in s][0]
+        sql = [s for s in self._sql(offline_backend) if '"sm_api_tokens"' in s][0]
         assert '"token_hash" CHAR(64) NOT NULL UNIQUE' in sql
 
     def test_no_token_column_anywhere(self, offline_backend):
@@ -223,7 +231,7 @@ class TestDDL:
         names = " ".join(
             factory(offline_backend.dialect).to_sql()[0] for factory in INDEX_EXPRESSIONS
         )
-        assert 'ix_schedules_user' in names
+        assert 'ix_sm_schedules_user' in names
 
 
 # ── Model validation (no database) ────────────────────────────────────────────

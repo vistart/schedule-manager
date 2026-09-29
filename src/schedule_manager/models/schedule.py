@@ -41,7 +41,7 @@ class Schedule(
     caller cannot reach another user's row by passing a different id.
     """
 
-    __table_name__ = "schedules"
+    __table_name__ = "sm_schedules"
     __pk_auto_generated__ = True
     __query_class__ = UserScopedQuery
     __jsonb_list_fields__ = _JSON_LIST_FIELDS

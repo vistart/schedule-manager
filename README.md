@@ -85,15 +85,20 @@ schedule-manager user open --username alice --label laptop
 
 ## 数据模型
 
+所有表都带 `sm_` 前缀：库可能与其它服务共用，`users` / `schedules` 这种名字别人也会用。
+表名只在 model 上声明一次（`__table_name__`），`schema/` 用 `Model.table_name()` 读回来而不是
+再抄一份字符串，索引名也由表名派生——PostgreSQL 的索引全在一个命名空间里，索引名撞车会
+让整个 `create_all` 挂掉。
+
 | 表 | 关键列 | 说明 |
 |---|---|---|
-| `users` | `username` 唯一、`is_active` | 账户。销户是停用不是删除，历史归属必须可追溯 |
-| `api_tokens` | `token_hash` 唯一、`revoked_at`、`expires_at` | `user_id` → `users` `ON DELETE RESTRICT` |
-| `api_token_scopes` | 复合主键 `(api_token_id, scope)` | 一行一个 scope；`ON DELETE CASCADE`（子集合无独立含义） |
-| `schedules` | `user_id` | → `users` `ON DELETE RESTRICT`，其余字段同旧版 |
+| `sm_users` | `username` 唯一、`is_active` | 账户。销户是停用不是删除，历史归属必须可追溯 |
+| `sm_api_tokens` | `token_hash` 唯一、`revoked_at`、`expires_at` | `user_id` → `sm_users` `ON DELETE RESTRICT` |
+| `sm_api_token_scopes` | 复合主键 `(api_token_id, scope)` | 一行一个 scope；`ON DELETE CASCADE`（子集合无独立含义） |
+| `sm_schedules` | `user_id` | → `sm_users` `ON DELETE RESTRICT`，其余字段同旧版 |
 
-`ON DELETE` 语义按关系性质区分：`schedules` / `api_tokens` 指向 `users` 用
-`RESTRICT`（承载独立数据，不能连带清空）；`api_token_scopes` 指向 `api_tokens`
+`ON DELETE` 语义按关系性质区分：`sm_schedules` / `sm_api_tokens` 指向 `sm_users` 用
+`RESTRICT`（承载独立数据，不能连带清空）；`sm_api_token_scopes` 指向 `sm_api_tokens`
 用 `CASCADE`（子集合，令牌没了就是垃圾）。
 
 **scope 是封闭词表**：`schedules:read`、`schedules:write`。SDK 用

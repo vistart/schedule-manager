@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import AsyncIterator, ClassVar, Iterable, Optional, Sequence
 
 from dateutil.tz import tzutc
+from rhosocial.activerecord.backend.errors import IntegrityError
 from rhosocial.activerecord.base.field_proxy import FieldProxy
 from rhosocial.activerecord.field.timestamp import DefaultTimestampMixin
 from rhosocial.activerecord.model import AsyncActiveRecord
@@ -74,6 +75,37 @@ def validate_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
     return wanted
 
 
+#: PostgreSQL SQLSTATE for ``unique_violation``.
+UNIQUE_VIOLATION = "23505"
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Whether ``exc`` is the database rejecting a duplicate ``username``.
+
+    Matching on the constraint *name* is what this used to do, and it never
+    worked: the name PostgreSQL generates for a bare ``UNIQUE`` column is
+    ``<table>_username_key``, not the ``uq_users_username`` the check spelled, so
+    the branch only ever fired through its substring fallback.  Worse, any such
+    name is a function of the table name, so it silently stops matching the day
+    the table is renamed — a check that looks load-bearing and is not.
+
+    The SQLSTATE is the signal that does not move when the schema does, and it
+    distinguishes a unique violation from the other integrity failures the same
+    exception class covers — a NOT NULL or CHECK violation must not be reported
+    as "username already taken".  The class alone is therefore not enough, and
+    the substring test stays only as a last resort for a driver that surfaces
+    neither.
+    """
+    if not isinstance(exc, IntegrityError):
+        return False
+    cause = exc.__cause__
+    sqlstate = getattr(cause, "sqlstate", None)
+    if sqlstate is not None:
+        return sqlstate == UNIQUE_VIOLATION
+    text = str(exc).lower()
+    return "unique" in text and "violat" in text
+
+
 class UserAccountMixin:
     """Account lifecycle and credential verification.  Behaviour only."""
 
@@ -100,7 +132,7 @@ class UserAccountMixin:
             try:
                 await user.save()
             except Exception as exc:  # noqa: BLE001 - narrowed below
-                if "uq_users_username" in str(exc) or "unique" in str(exc).lower():
+                if _is_unique_violation(exc):
                     raise UsernameTaken(f"username {handle!r} is already taken") from exc
                 raise
             plaintext, _token_id = await user.issue_token(
@@ -111,7 +143,7 @@ class UserAccountMixin:
     async def close_account(self) -> None:
         """Deactivate the account and revoke every token it owns.
 
-        The ``users`` row is kept: ``schedules.user_id`` is ``ON DELETE
+        The ``sm_users`` row is kept: ``sm_schedules.user_id`` is ``ON DELETE
         RESTRICT`` and historical attribution has to stay resolvable.  The
         account's schedules are left untouched — they simply stop being
         reachable, because a deactivated user cannot authenticate.
@@ -227,7 +259,7 @@ class UserAccountMixin:
 class User(UserAccountMixin, DefaultTimestampMixin, AsyncActiveRecord):
     """Account holder.  Readable across users by design — see the module docstring."""
 
-    __table_name__ = "users"
+    __table_name__ = "sm_users"
     __pk_auto_generated__ = True
 
     c: ClassVar[FieldProxy] = FieldProxy()

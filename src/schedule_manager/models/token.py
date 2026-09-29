@@ -104,7 +104,7 @@ class ApiToken(DefaultTimestampMixin, AsyncActiveRecord):
     select them — they are opt-in and cost a subquery each.
     """
 
-    __table_name__ = "api_tokens"
+    __table_name__ = "sm_api_tokens"
     __pk_auto_generated__ = True
 
     c: ClassVar[FieldProxy] = FieldProxy()
@@ -124,7 +124,7 @@ class ApiToken(DefaultTimestampMixin, AsyncActiveRecord):
 class ApiTokenScope(CompositePKMixin, AsyncActiveRecord):
     """One granted scope per row; a token with no rows can do nothing."""
 
-    __table_name__ = "api_token_scopes"
+    __table_name__ = "sm_api_token_scopes"
     __primary_key__ = ("api_token_id", "scope")
 
     c: ClassVar[FieldProxy] = FieldProxy()

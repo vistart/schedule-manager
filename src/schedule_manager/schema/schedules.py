@@ -1,4 +1,4 @@
-"""DDL for the ``schedules`` table."""
+"""DDL for the ``sm_schedules`` table."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from .users import TABLE_NAME as USERS_TABLE
 if TYPE_CHECKING:
     from rhosocial.activerecord.backend.expression.bases import SQLDialectBase
 
-TABLE_NAME = "schedules"
+#: Derived from the model; see the note in ``users.py``.
+TABLE_NAME = Schedule.table_name()
 
 
 def create_table_expression(dialect: "SQLDialectBase") -> CreateTableExpression:

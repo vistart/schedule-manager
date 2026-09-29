@@ -1,4 +1,4 @@
-"""DDL for the ``api_tokens`` and ``api_token_scopes`` tables.
+"""DDL for the ``sm_api_tokens`` and ``sm_api_token_scopes`` tables.
 
 ``ON DELETE`` follows the nature of the relationship, not a single rule:
 
@@ -20,14 +20,16 @@ from rhosocial.activerecord.backend.expression.statements import (
     TableConstraintType,
 )
 
+from ..models import ApiToken, ApiTokenScope
 from ._column import TIMESTAMP, column
 from .users import TABLE_NAME as USERS_TABLE
 
 if TYPE_CHECKING:
     from rhosocial.activerecord.backend.expression.bases import SQLDialectBase
 
-TOKENS_TABLE = "api_tokens"
-SCOPES_TABLE = "api_token_scopes"
+#: Derived from the models for the same reason as ``users.TABLE_NAME``.
+TOKENS_TABLE = ApiToken.table_name()
+SCOPES_TABLE = ApiTokenScope.table_name()
 
 
 def create_tokens_expression(dialect: "SQLDialectBase") -> CreateTableExpression:
@@ -74,7 +76,15 @@ def create_token_scopes_expression(dialect: "SQLDialectBase") -> CreateTableExpr
             TableConstraint(
                 dialect,
                 TableConstraintType.PRIMARY_KEY,
-                name="pk_api_token_scopes",
+                # Derived, not written out.  This is the only constraint in the
+                # schema whose name reaches the SQL — an inline PRIMARY KEY,
+                # UNIQUE or REFERENCES is emitted bare and PostgreSQL names it
+                # from the table — and constraint names share one namespace with
+                # index names.  A name written here outlives the table it belongs
+                # to: keeping the old one blocked CREATE TABLE on the renamed
+                # table with "relation already exists", because the previous
+                # version of this table still owned it.
+                name=f"pk_{SCOPES_TABLE}",
                 columns=["api_token_id", "scope"],
             )
         ],

@@ -39,6 +39,15 @@ cover/
 .env
 .env.*
 !.env.example
+# Same role as .env but the name does not match the patterns above, and it holds
+# a database password. It is untracked, so one `git add -A` from being committed.
+supabase.env
+# Deployment material: the production CA lives here but is not part of the
+# project. Certificates are not secrets, which is exactly why they end up
+# committed by accident.
+*.crt
+*.pem
+*.key
 .venv*/
 venv/
 ENV/
@@ -47,3 +56,4 @@ ENV/
 *.swp
 *.swo
 *~
+.claude/plan/

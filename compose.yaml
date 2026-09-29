@@ -1,0 +1,83 @@
+# Local/container deployment: PostgreSQL, a one-shot schema job, and the server.
+#
+#   docker compose up -d --build
+#   docker compose run --rm app schedule-manager user open --username alice
+#
+# The `migrate` service exists because SCHEDULE_AUTO_MIGRATE=0 is baked into the
+# image: replicas boot at the same time, and every one of them issuing CREATE
+# TABLE IF NOT EXISTS against the same tables contends on the same locks.  Schema
+# changes are a deploy step, so it runs here, once, before the server starts.
+
+x-db-env: &db-env
+  SCHEDULE_DB_HOST: postgres
+  SCHEDULE_DB_PORT: "5432"
+  SCHEDULE_DB_NAME: ${SCHEDULE_DB_NAME:-schedule_manager_db}
+  SCHEDULE_DB_USER: ${SCHEDULE_DB_USER:-postgres}
+  SCHEDULE_DB_PASSWORD: ${SCHEDULE_DB_PASSWORD:?set SCHEDULE_DB_PASSWORD in .env}
+
+x-app: &app
+  image: schedule-manager:local
+  build:
+    context: .
+  environment:
+    <<: *db-env
+    SCHEDULE_BIND_HOST: 0.0.0.0
+    SCHEDULE_BIND_PORT: "8000"
+    # This is the OAuth resource identifier that issued tokens are bound to, so it
+    # must be the URL a client actually dials.  On a real deployment it is the HTTPS
+    # name in front of this container — and it also derives the default Host/Origin
+    # allowlist, so a proxy that rewrites Host needs SCHEDULE_ALLOWED_HOSTS as well.
+    SCHEDULE_PUBLIC_URL: ${SCHEDULE_PUBLIC_URL:-http://localhost:8000}
+    SCHEDULE_ALLOWED_HOSTS: ${SCHEDULE_ALLOWED_HOSTS:-}
+    SCHEDULE_ALLOWED_ORIGINS: ${SCHEDULE_ALLOWED_ORIGINS:-}
+    SCHEDULE_LOG_LEVEL: ${SCHEDULE_LOG_LEVEL:-WARNING}
+    # One worker per core is the throughput ceiling; each one opens its own pool.
+    SCHEDULE_WORKERS: ${SCHEDULE_WORKERS:-1}
+    SCHEDULE_POOL_MIN: ${SCHEDULE_POOL_MIN:-1}
+    SCHEDULE_POOL_MAX: ${SCHEDULE_POOL_MAX:-10}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SCHEDULE_DB_NAME:-schedule_manager_db}
+      POSTGRES_USER: ${SCHEDULE_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${SCHEDULE_DB_PASSWORD:?set SCHEDULE_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The server is useless without this, and without -d pg_isready answers
+      # "accepting" during the brief window before the real server is up.
+      test: ["CMD-SHELL", "pg_isready -U ${SCHEDULE_DB_USER:-postgres} -d ${SCHEDULE_DB_NAME:-schedule_manager_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["schedule-manager-setup-db"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    <<: *app
+    restart: unless-stopped
+    # Published on loopback only.  Anything else needs TLS in front of it: the
+    # bearer token crosses this hop in a header, in clear.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Long enough for uvicorn to drain and the lifespan to close the pool, so
+    # in-flight tool calls are not cut off mid-transaction.
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:

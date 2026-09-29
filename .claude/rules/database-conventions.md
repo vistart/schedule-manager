@@ -2,15 +2,64 @@
 
 ## Model Pattern
 
-Models inherit from `AsyncActiveRecord` and use mixins:
+Models live in `src/schedule_manager/models/`, one class per file, and are
+imported from the package rather than from submodules:
 
 ```python
-class MyModel(AsyncActiveRecord, TimestampMixin, SoftDeleteMixin):
+from .models import Schedule
+```
+
+```python
+class MyModel(UserOwnedMixin, JsonbListMixin,
+              DefaultTimestampMixin, DefaultAsyncSoftDeleteMixin, AsyncActiveRecord):
     __table_name__ = "my_table"
     __pk_auto_generated__ = True
+    __query_class__ = UserScopedQuery      # only if it is owned by a user
     id: Optional[int] = None
     # ... fields
 ```
+
+Import them from the package, never from `models.schedule` directly — the
+package `__init__` is the single import surface.
+
+## User Scoping
+
+Read scoping lives in `UserScopedQuery.__init__`
+(`models/base.py`), which attaches the current identity to `where_clause` at
+construction time. `Model.query()` is `return cls.__query_class__(cls)`
+(`base/query_mixin.py:135`), so one override covers every terminal method —
+`all`, `one`, `count`, `exists`, `aggregate`, `sum_`, `update_all`,
+`delete_all` — and any added later.
+
+Do **not** override the terminal methods instead. The execution paths are not
+unified: `count` and the numeric aggregates funnel into
+`await self.aggregate()` (`aggregate.py:450`) while `all()` goes through
+`self.to_sql()`. Missing one of those patches raises nothing and silently
+returns another user's rows.
+
+Write scoping lives in `UserOwnedMixin.prepare_save_data`, which the framework
+chains along the MRO (`base/base.py:1074-1081`). It overwrites `user_id` on
+both INSERT and UPDATE, so ownership can never be supplied by a caller.
+
+Assert the contract in tests by inspecting generated SQL, which needs no
+database:
+
+```python
+with as_user(7):
+    assert '"user_id" = %s' in Schedule.query().to_sql()[0]
+```
+
+`Schedule.unscoped()` is the management-plane escape hatch. It is never
+reachable from an MCP tool or a business command, and it also bypasses the
+soft-delete filter.
+
+## Forbidden Query Paths
+
+Do not read `schedules`, `users`, `api_tokens` or `api_token_scopes` through
+`CTEQuery`, `SetOperationQuery` or `backend.execute`. They bypass
+`Model.query()` and are the only route that can miss the user filter. Raw SQL
+does not appear in application code at all: the schema is assembled in
+`schema/`, and no query is written by hand anywhere in `src/`.
 
 ## Async Usage
 
@@ -50,23 +99,45 @@ Validation runs automatically before `save()`.
 
 ## DDL / Schema Setup
 
-Schema creation is **not** exposed in MCP/CLI tools (prevents privilege escalation). Use the standalone script:
+Schema creation is **not** exposed in MCP/CLI tools (prevents privilege
+escalation). Use the standalone script:
 
 ```bash
-python -m schedule_manager.setup_db
+schedule-manager-setup-db
 ```
 
-This calls `generate_create_table(if_not_exists=True)` and executes the SQL via the backend.
+It runs `schema.create_all()`. DDL is hand-written in `schema/`, one module per
+table; `rhosocial-activerecord` no longer renders DDL from a model.
+
+There is no migration path. Every statement is `IF NOT EXISTS`, and a database
+carrying an older shape is not upgraded in place.
+
+Indexes must be standalone `CreateIndexExpression` statements — the formatter
+rejects them inside `CREATE TABLE` with `UnsupportedFeatureError`
+(`dialect/mixins/ddl_table.py:613-620`).
 
 ## Backend Configuration
 
-```python
-from rhosocial.activerecord.backend.impl.postgres import AsyncPostgresBackend
-from rhosocial.activerecord.backend.impl.postgres.config import PostgresConnectionConfig
+`Model.configure()` is per-class: each call constructs a new backend instance
+and opens its own connection. Configuring several models therefore yields
+several connections, and a transaction opened through one model does not cover
+statements issued through another.
 
-config = PostgresConnectionConfig(host=..., port=..., database=..., username=..., password=...)
-await MyModel.configure(config, AsyncPostgresBackend)
+Always go through `db.connect()`, which configures one class and shares the
+resulting backend with the rest:
+
+```python
+from .db import connect
+
+backend = await connect()          # or await connect(config)
+await create_all(backend)
 ```
+
+The Postgres backend keeps a single connection and its transaction state is
+instance-level, so a nested `backend.transaction()` would commit the enclosing
+unit's work early. `models/user.py` works around this with a `transaction()`
+helper that joins an already-open transaction instead of starting a new one —
+use that helper for any multi-statement model operation.
 
 ## PostgreSQL Features Used
 

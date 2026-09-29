@@ -1,15 +1,44 @@
 # schedule-manager
 
-面向 LLM 工具调用的日程管理系统，提供 MCP Server 和 CLI 两种接口。
+面向 LLM 工具调用的多用户日程管理系统，提供远程 MCP Server（Streamable HTTP）和 CLI 两种接口。
+**每个请求携带 Bearer 令牌，所有查询自动限定在该令牌对应的用户范围内。**
 
 ## 技术栈
 
 - **Python 3.12+**
 - **rhosocial-activerecord** — ActiveRecord 模式 ORM
 - **rhosocial-activerecord-postgres** — PostgreSQL 异步后端（psycopg3）
-- **MCP SDK v2** — FastMCP，提供标准 MCP 工具接口
+- **MCP SDK v2**（`MCPServer`）— Streamable HTTP 传输 + OAuth 2.1 资源服务器
 - **python-dateutil** — RFC 5545 RRULE 解析
 - **Pydantic** — 模型校验
+
+## 核心设计：身份如何隔离
+
+```
+HTTP 请求
+  BearerAuthBackend → TokenTableVerifier → User.resolve_token()   ← 哈希查库 + 校验，每次请求一次
+      → 写 auth_context_var（SDK 挂载的 AuthContextMiddleware）
+  → 工具执行
+      → Schedule.query() → current_user_id() → WHERE user_id = <已验证>   ← 零解析
+```
+
+三条强制点，覆盖全部读写路径：
+
+| 路径 | 机制 |
+|---|---|
+| 读 | `UserScopedQuery.__init__` 在**构造期**把身份挂进 `where_clause` |
+| 写 | `UserOwnedMixin.prepare_save_data` 覆写 `user_id`（INSERT 与 UPDATE 都覆写） |
+| 身份来源 | `identity.current_user_id()`，全项目唯一出口 |
+
+**为什么接缝选在 `__init__` 而不是各个终结方法**：`Model.query()` 就是
+`return cls.__query_class__(cls)`（`base/query_mixin.py:135`），谓词在构造期
+就位，之后 `all` / `one` / `count` / `exists` / `aggregate` / `sum_` /
+`update_all` / `delete_all` 全部自动继承。
+若改为逐个覆写终结方法则需要 5~6 处，因为执行路径并不统一——
+`count` 与数值聚合走 `await self.aggregate()`（`aggregate.py:450`），
+而 `all()` 走 `self.to_sql()`。漏掉任一处**不报错**，只会静默返回别人的数据。
+
+**跨用户访问表现为 `NOT_FOUND` 而非 `FORBIDDEN`**，避免通过 id 探测他人数据是否存在。
 
 ## 安装
 
@@ -18,320 +47,305 @@ git clone https://github.com/vistart/schedule-manager.git
 cd schedule-manager
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[test]"
 ```
 
-> 若要用本地编辑模式装 `rhosocial-activerecord` / `rhosocial-activerecord-postgres`、
-> 单独配 pip 源，或接入 opencode，见 [接入 opencode](#接入-opencode) 的完整步骤。
+> 本地编辑模式安装 ORM 依赖（改动即时生效）、接入 opencode 的完整步骤见
+> [接入 opencode](#接入-opencode)。
 
 ## 配置
-
-复制 `.env.example` 为 `.env`，填入数据库连接信息：
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` 示例：
+| 变量 | 说明 |
+|---|---|
+| `SCHEDULE_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` | 数据库连接 |
+| `SCHEDULE_TOKEN` | 本地调用者的 Bearer 令牌（明文仅此一份，库里只存哈希） |
+| `SCHEDULE_TOKEN_FILE` | 令牌文件路径，**优先于** `SCHEDULE_TOKEN`；可 `chmod 600` |
+| `SCHEDULE_BIND_HOST` / `_BIND_PORT` | 远程服务监听地址，默认 `127.0.0.1:8000` |
+| `SCHEDULE_PUBLIC_URL` | 对外可达 URL，即 OAuth 资源标识；非本地必须 HTTPS |
+| `SCHEDULE_ALLOWED_HOSTS` / `_ALLOWED_ORIGINS` | DNS rebinding 防护白名单 |
 
-```
-SCHEDULE_DB_HOST=192.168.1.3
-SCHEDULE_DB_PORT=17689
-SCHEDULE_DB_NAME=schedule_manager_db
-SCHEDULE_DB_USER=root
-SCHEDULE_DB_PASSWORD=your_password
-```
+`SCHEDULE_TOKEN_FILE` 更安全：导出到环境变量的值在 `/proc/<pid>/environ` 里可见，
+文件可以只让本人读。
 
-初始化数据库表：
+### 初始化与开户
 
 ```bash
-schedule-manager-setup-db
+schedule-manager-setup-db      # 建表 + 建索引
+schedule-manager user open --username alice --label laptop
 ```
+
+`user open` 会打印一次明文令牌。之后库里只保留 SHA-256 摘要，**无法恢复**。
+
+> 所有语句都是 `IF NOT EXISTS`。**本项目不做数据库迁移** —— DDL 即 schema，
+> 携带旧结构的库不会被就地升级。
 
 ## 数据模型
 
-`schedules` 表结构：
+| 表 | 关键列 | 说明 |
+|---|---|---|
+| `users` | `username` 唯一、`is_active` | 账户。销户是停用不是删除，历史归属必须可追溯 |
+| `api_tokens` | `token_hash` 唯一、`revoked_at`、`expires_at` | `user_id` → `users` `ON DELETE RESTRICT` |
+| `api_token_scopes` | 复合主键 `(api_token_id, scope)` | 一行一个 scope；`ON DELETE CASCADE`（子集合无独立含义） |
+| `schedules` | `user_id` | → `users` `ON DELETE RESTRICT`，其余字段同旧版 |
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | INTEGER (PK) | 自增主键 |
-| `title` | TEXT | 日程标题（必填，非空） |
-| `description` | TEXT | 详细描述 |
-| `status` | TEXT | 状态：`pending` / `in_progress` / `completed` / `cancelled` |
-| `priority` | INTEGER | 优先级 1（最高）~ 5（最低），默认 3 |
-| `start_time` | TIMESTAMP | 开始时间 |
-| `due_time` | TIMESTAMP | 截止时间 |
-| `completed_at` | TIMESTAMP | 完成时间 |
-| `location` | TEXT | 地点 |
-| `tags` | JSONB | 标签列表 |
-| `rrule` | TEXT | RFC 5545 循环规则 |
-| `rdate` | JSONB | 循环例外日期 |
-| `exdate` | JSONB | 排除日期 |
-| `created_at` | TIMESTAMP | 创建时间（自动） |
-| `updated_at` | TIMESTAMP | 更新时间（自动） |
-| `deleted_at` | TIMESTAMP | 软删除时间（NULL = 未删除） |
+`ON DELETE` 语义按关系性质区分：`schedules` / `api_tokens` 指向 `users` 用
+`RESTRICT`（承载独立数据，不能连带清空）；`api_token_scopes` 指向 `api_tokens`
+用 `CASCADE`（子集合，令牌没了就是垃圾）。
 
-## CLI 使用
+**scope 是封闭词表**：`schedules:read`、`schedules:write`。SDK 用
+`AuthSettings.required_scopes` 生成 PRM 的 `scopes_supported`，库里出现词表外的
+scope 会让两者漂移。无 scope 行的令牌 = 任何工具都不可用（fail-closed）。
 
-### 输出格式
+## 令牌设计
 
-默认 JSON 信封格式：
-
-```json
-{"status": "ok", "data": {...}}
-{"status": "error", "error": {"code": "NOT_FOUND", "message": "..."}}
+```
+生成:  sm_<32 bytes urlsafe>          仅签发时出现一次
+存库:  sha256(token).hexdigest()       CHAR(64) UNIQUE
 ```
 
-加 `--human` 输出人类可读文本。
-
-### 全局选项
-
-| 选项 | 说明 |
-|------|------|
-| `--human` | 输出人类可读文本 |
-| `--describe` | 输出机器可读的 JSON Schema 并退出 |
-| `--help` | 显示帮助 |
-
-### 命令
-
-#### `create` — 创建日程
-
-```bash
-schedule-manager create --title '团队站会' --priority 3
-schedule-manager create --title '部署 v2' --due-time '2026-09-10T14:00:00' --tags 'deploy,critical'
-schedule-manager create --title '每日晨会' --rrule 'FREQ=DAILY' --start-time '2026-09-06T09:00:00'
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `--title` | string | 是 | 标题（非空） |
-| `--description` / `-d` | string | 否 | 描述 |
-| `--status` | string | 否 | 状态（默认 pending） |
-| `--priority` | int | 否 | 优先级 1-5（默认 3） |
-| `--start-time` | string | 否 | ISO 8601 开始时间 |
-| `--due-time` | string | 否 | ISO 8601 截止时间 |
-| `--location` | string | 否 | 地点 |
-| `--tags` | string | 否 | 逗号分隔的标签 |
-| `--rrule` | string | 否 | RFC 5545 循环规则 |
-| `--dry-run` | flag | 否 | 预览，不真正创建 |
-
-#### `get` — 查询日程
-
-```bash
-schedule-manager get --id 1
-```
-
-#### `update` — 更新日程（只修改提供的字段）
-
-```bash
-schedule-manager update --id 1 --status completed
-schedule-manager update --id 1 --title '新标题' --priority 1
-```
-
-#### `delete` — 软删除日程
-
-```bash
-schedule-manager delete --id 1
-```
-
-#### `complete` — 标记完成
-
-```bash
-schedule-manager complete --id 1
-```
-
-#### `list` — 分页列表
-
-```bash
-schedule-manager list
-schedule-manager list --status pending --sort-by priority --sort-order asc
-schedule-manager list --page 2 --page-size 10
-schedule-manager list --keyword 会议
-```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--page` | 1 | 页码 |
-| `--page-size` | 20 | 每页条数（1-100） |
-| `--status` | - | 按状态筛选 |
-| `--priority` | - | 按优先级筛选 |
-| `--keyword` | - | 关键词搜索（匹配标题和描述） |
-| `--sort-by` | due_time | 排序字段：due_time / created_at / updated_at / priority / title |
-| `--sort-order` | asc | 排序方向：asc / desc |
-
-#### `search` — 关键词搜索
-
-```bash
-schedule-manager search --keyword deadline
-```
-
-### 退出码
-
-| 退出码 | 含义 |
-|--------|------|
-| 0 | 成功 |
-| 1 | 一般错误 |
-| 2 | 参数错误 |
-| 20 | 资源不存在 |
-| 40 | 校验错误 |
+- **存哈希不存明文**。这是公共服务，库被读就等于全部凭据泄露。
+- **用 SHA-256 而非 bcrypt/argon2**：令牌是 256 位高熵随机串，不是低熵口令，
+  没有抗暴力破解需求，无需故意拖慢。查找走唯一索引，连常量时间比较都不需要。
+- **不透明而非 JWT**：天然没有 `aud` 混淆（为别的服务签发的令牌调不了本服务），
+  代价是无法自包含身份，换来的是无需外部 IdP、吊销即时生效。
 
 ## MCP Server
 
-启动（stdio）：
+### 启动
 
 ```bash
 schedule-manager-mcp
 ```
 
-安装后提供的 `schedule-manager-mcp` 控制台入口会读取 `SCHEDULE_DB_*` 环境变量
-（缺省回退到项目根目录的 `.env`），并保证 `schedules` 表存在。
+监听 `SCHEDULE_BIND_HOST:SCHEDULE_BIND_PORT`，MCP 端点在 `/mcp`。
+
+**DNS rebinding 防护只在绑定地址是 loopback 时自动开启**
+（`mcpserver/server.py:1144-1150`）。部署到真实域名上必须显式设置
+`SCHEDULE_ALLOWED_HOSTS` / `SCHEDULE_ALLOWED_ORIGINS`，否则端点处于无保护状态。
+
+### 认证与授权
+
+| 情况 | 响应 |
+|---|---|
+| 无令牌 / 令牌不存在 | `401` + `WWW-Authenticate`（含 `resource_metadata`） |
+| 令牌已吊销 / 过期 | `401` |
+| 用户已停用 | `401` |
+| scope 不足 | `403` + `WWW-Authenticate: error="insufficient_scope", scope="<缺失的>"` |
+| 访问他人日程 | `NOT_FOUND`（工具返回的错误字典） |
+
+scope 按**单个工具**判定，而不是全局：
+
+| 工具 | 所需 scope |
+|---|---|
+| `whoami` | 无 |
+| `get_schedule` / `list_schedules` / `search_schedules` | `schedules:read` |
+| `create_schedule` / `update_schedule` / `delete_schedule` / `complete_schedule` | `schedules:write` |
+
+只读令牌不能写，但能读；`whoami` 不需要任何 scope，所以零授权的令牌也知道
+自己是谁。
+
+### 工具列表
+
+| 工具 | 说明 |
+|---|---|
+| `whoami` | 当前用户 id / username / 令牌的 scopes / 过期时间 |
+| `create_schedule` | 创建日程 |
+| `get_schedule` | 按 ID 查询 |
+| `update_schedule` | 更新（只改传入的字段） |
+| `delete_schedule` | 软删除 |
+| `list_schedules` | 分页列表（筛选、排序） |
+| `complete_schedule` | 标记完成 |
+| `search_schedules` | 关键词搜索 |
+
+所有工具参数均为命名参数，返回 JSON 字典。
+
+**没有任何工具可以跨用户枚举。** `User` / `ApiToken` 出于管理需要不是用户隔离
+模型，把它们做成工具等于开放全量用户转储。
 
 ### 接入 opencode
 
-opencode 通过原生 MCP 支持接入，配置放在项目根目录的 `opencode.json`。
-
-**步骤 1：装好虚拟环境与数据库**
-
-```bash
-cd /path/to/schedule-manager
-
-# 虚拟环境。--without-pip + --system-site-packages 与本项目现有环境一致，
-# pip 来自 ~/.local 的用户级 site-packages，因此没有 .venv*/bin/pip，
-# 一律用 `python -m pip` 调用。
-python3 -m venv --without-pip --system-site-packages .venv3.14-ubuntu26.04
-
-# 可选：给该虚拟环境单独配 pip 源（放在 venv 根目录，pip 会按 site 级自动读取，
-# 不影响其它项目和全局配置）
-cat > .venv3.14-ubuntu26.04/pip.conf <<'EOF'
-[global]
-index-url = https://mirrors.aliyun.com/pypi/simple/
-trusted-host = mirrors.aliyun.com
-timeout = 120
-EOF
-
-# 本地编辑模式安装两个 ORM 依赖（改动即时生效，无需重装）
-.venv3.14-ubuntu26.04/bin/python -m pip install -e /path/to/rhosocial/python-activerecord
-.venv3.14-ubuntu26.04/bin/python -m pip install -e /path/to/rhosocial/python-activerecord-postgres
-
-# 安装本项目，注册 schedule-manager / schedule-manager-setup-db / schedule-manager-mcp
-.venv3.14-ubuntu26.04/bin/python -m pip install -e ".[test]"
-```
-
-确认依赖确实指向本地源码树：
-
-```bash
-.venv3.14-ubuntu26.04/bin/python -m pip show rhosocial-activerecord | rg "Editable"
-```
-
-按 `.env.example` 建好 `.env` 并填入真实连接参数，然后建库建表
-（数据库本身不存在时需先 `CREATE DATABASE`）：
-
-```bash
-.venv3.14-ubuntu26.04/bin/schedule-manager-setup-db
-```
-
-**步骤 2：写 `opencode.json`**
-
-连接参数一律不落在仓库里，五个变量全部用 `{env:VAR}` 从启动 opencode 的 shell 读取：
+配置写在**全局** `~/.config/opencode/opencode.json`（不在仓库里）：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "schedule-manager": {
-      "type": "local",
-      "command": [".venv3.14-ubuntu26.04/bin/schedule-manager-mcp"],
-      "cwd": ".",
+      "type": "remote",
+      "url": "http://127.0.0.1:18000/mcp",
       "enabled": true,
-      "timeout": 120000,
-      "environment": {
-        "SCHEDULE_DB_HOST": "{env:SCHEDULE_DB_HOST}",
-        "SCHEDULE_DB_PORT": "{env:SCHEDULE_DB_PORT}",
-        "SCHEDULE_DB_NAME": "{env:SCHEDULE_DB_NAME}",
-        "SCHEDULE_DB_USER": "{env:SCHEDULE_DB_USER}",
-        "SCHEDULE_DB_PASSWORD": "{env:SCHEDULE_DB_PASSWORD}"
-      }
+      "oauth": false,
+      "timeout": 60000,
+      "headers": { "Authorization": "Bearer sm_xxx" }
     }
   }
 }
 ```
 
-- `command` 用**相对路径**配合 `cwd`（相对路径按 workspace 解析），这样配置本身不含
-  本机绝对路径，可以直接提交共享。若把 `opencode.json` 放到别处或用全局配置，
-  改成绝对路径并去掉 `cwd`。
-- `timeout` 必调，原因见下方「两个容易踩的点」。
+- `oauth: false` 关闭 opencode 的自动 OAuth 探测——服务端用的是静态令牌。
+- `url` 里的 host:port 必须和容器启动时的 `SCHEDULE_PUBLIC_URL` 一致，否则 Host 头
+  对不上，被 DNS-rebinding 防护挡成 421。
+- **不要把令牌放进 `command` 的 args**，那会出现在 `ps aux` 里。
 
-**步骤 3：把 `.env` 导出到 shell**
+放全局而不是项目 `opencode.json` 有两个原因。**一是覆盖面**：opencode 的配置优先级是
+「远程 < 全局 < `OPENCODE_CONFIG` < 项目 < `.opencode/` < `OPENCODE_CONFIG_CONTENT`」，
+项目里的 `opencode.json` 会压过全局——同一个 server 名两处都写，在项目目录里生效的永远
+是项目那份，全局那条等于白写。**二是密钥**：项目配置是要入库的，而全局配置不是。
 
-`.env` 本身已被 `.gitignore` 排除，唯一的连接信息来源。用 `set -a` 一次性导出其中
-所有变量，让 `{env:VAR}` 有值可取：
-
-```bash
-set -a; . ./.env; set +a
-```
-
-**步骤 4：验证连通性**
-
-```bash
-opencode mcp list
-```
-
-期望输出 `✓ schedule-manager connected`。若显示 `failed`，见下方排错。
-
-**步骤 5：重启 opencode**
-
-config 只在启动时加载，**必须退出并重启 opencode** 才生效；当前会话仍使用旧配置。
-
-之后即可用自然语言控制日程，例如「把下周一上午十点的团队站会建成日程，优先级 2」。
-
-#### 两个容易踩的点
-
-- **`timeout` 必须调大**。schema 里 `McpLocalConfig.timeout` 默认只有 5000ms，而本服务
-  导入依赖较重、冷启动约 15s，不改会直接超时。
-- **`.env` 不再兜底**。`load_dotenv(override=False)` 不会覆盖已存在的环境变量，所以
-  `environment` 里声明过的键，即使取到空值也不会再回退 `.env`；此时会抛出
-  `DatabaseError` 并指明缺失的变量名。这就是步骤 3 必须先执行的原因。
-
-#### 排错
-
-| 现象 | 原因与处理 |
-|------|-----------|
-| `MCP error -32000: Connection closed` | `environment` 里的变量取到空值，多半是漏了步骤 3。用 `opencode mcp list --print-logs` 看 stderr，或直接运行 `schedule-manager-mcp` 复现，会打印出缺失的变量名 |
-| `File not found: .../schedule_manager.mcp_server` | 用了 `mcp run <点号模块>`。mcp 2.x 的 `mcp run` 只接受文件路径，请改用 `schedule-manager-mcp` 控制台入口 |
-| 请求超时 | `timeout` 太小。冷启动约 15s，建议 ≥ 60000 |
-| `connection refused` | 端口不对或数据库不可达。`psql -h "$SCHEDULE_DB_HOST" -p "$SCHEDULE_DB_PORT" -U "$SCHEDULE_DB_USER" -l` 先确认连通 |
-
-#### 切换数据库
-
-改 `.env` 即可（每个 opencode 配置对应一个库，会话内固定）。需要按会话切库就得改成
-"命名 profile + 工具参数选库"的方案（当前未实现）。如果不想在 `opencode.json` 里
-出现 `environment` 块，把整个块删掉即可，服务会直接读 `.env`。
-
-### 接入其它 MCP 客户端
+所以令牌可以直接写在全局配置里，不必依赖环境变量。代价是这个文件从此是一份明文凭据，
+安全性取决于该文件的权限——它等价于把令牌放在一个 `0600` 的文件里，而不是放在
+`SCHEDULE_TOKEN` 环境变量里（后者任何能读 `/proc/<pid>/environ` 的进程都能看到）。
+想让它离开明文，opencode 提供了 `{file:...}`，语义等同 `SCHEDULE_TOKEN_FILE`：
 
 ```json
-{
-  "mcpServers": {
-    "schedule-manager": {
-      "command": "/abs/path/to/schedule-manager/.venv3.14-ubuntu26.04/bin/schedule-manager-mcp",
-      "args": []
-    }
-  }
-}
+"headers": { "Authorization": "Bearer {file:~/.config/schedule-manager/token}" }
 ```
-### 工具列表
 
-| 工具 | 说明 |
-|------|------|
-| `create_schedule` | 创建日程 |
-| `get_schedule` | 按 ID 查询 |
-| `update_schedule` | 更新日程（只改传入的字段） |
-| `delete_schedule` | 软删除 |
-| `list_schedules` | 分页列表（支持筛选、排序） |
-| `complete_schedule` | 标记完成 |
-| `search_schedules` | 关键词搜索 |
+**如果这份配置要入库，就必须用 `{env:SCHEDULE_TOKEN}` 而不是字面量。** 写死
+`"Bearer sm_alice"`，同事 clone 仓库后他的 opencode 就成了 alice——那个形式本身就是防
+"入库配置冒充身份"的手段。本仓库没有项目级 `opencode.json`，正是因为这个取舍。
 
-所有工具参数均为命名参数，返回 JSON 字典。
+验证：
+
+```bash
+opencode mcp list                   # 期望 schedule-manager connected
+opencode mcp debug schedule-manager # 连不上时看 HTTP 与鉴权细节
+```
+
+config 只在启动时加载，改完**必须重启 opencode**。
+
+#### 临时改指向（不改任何文件）
+
+`OPENCODE_CONFIG_CONTENT` 的优先级高于所有配置文件，可以在启动时覆盖。注意两点：
+覆盖条目**必须写全**——配置源之间是逐键合并的，但**每个配置源独立校验**，只写
+`headers` 会被拒绝（`Missing key mcp.schedule-manager.enabled`），不会替你从别处补齐；
+`timeout` 之类没冲突的键则会从下层配置继承。
+
+```bash
+export OPENCODE_CONFIG_CONTENT='{"mcp":{"schedule-manager":{
+  "type":"remote","url":"http://127.0.0.1:8000/mcp","enabled":true,
+  "oauth":false,"timeout":60000,
+  "headers":{"Authorization":"Bearer {env:SCHEDULE_TOKEN}"}}}}'
+opencode
+```
+
+### 健康检查
+
+`GET /healthz` 无需令牌，返回 `200 {"status":"ok"}` 或 `503 {"status":"unavailable"}`。
+它会真的 `SELECT 1` 探一次数据库——只报告"进程活着"的探针，会把一个连不上库
+的容器报成健康。lifespan 还没建好连接池时（`503`）也是正常状态。
+
+另一个无需令牌的端点是 `/.well-known/oauth-protected-resource`（OAuth 资源元数据），
+但它不碰数据库，不能当健康检查用。
+
+### 容器部署
+
+镜像用多阶段构建：builder 里 `pip wheel` 产出全部 wheel，运行阶段
+`--no-index` 离线安装，因此被测过的那份依赖集合就是发布的那份。进程以非 root
+运行，`CMD` 用 exec 形式，SIGTERM 才能到 uvicorn 并触发 lifespan 里的
+`close_pool`。
+
+```bash
+bash docker/build-wheels.sh       # 把两个 ORM wheel 放进 wheels/（首次必做）
+docker compose up -d --build
+docker compose run --rm app schedule-manager user open --username alice
+```
+
+`build-wheels.sh` 存在的原因：PyPI 上的 `rhosocial-activerecord` 是 **dev29**、
+`rhosocial-activerecord-postgres` 是 **dev16**，而 release 分支已经是 **dev30** /
+**dev17**，本地 venv 装的就是这两个分支。直接 `pip install .` 的话镜像跑的是
+落后一版的 ORM。脚本会先把源码拷到 `/tmp` 再构建——两个仓库在 Windows 盘挂载上，
+setuptools 扫包要几分钟，在原生文件系统上是几秒。
+
+依赖下载走阿里云镜像（`ARG PIP_INDEX_URL`，可用 `--build-arg` 覆盖）。注意改任何
+一行源码都会让这一层失效、下次构建重下全部依赖；把依赖层拆出来能解决，代价是一个
+需要 `|| true` 的空包桩，可能静默产出两个同版本 wheel，所以没做。
+
+镜像里已经写死了三件事：
+
+| ENV | 值 | 原因 |
+|---|---|---|
+| `SCHEDULE_BIND_HOST` | `0.0.0.0` | 默认是 `127.0.0.1`，容器内等于外部不可达 |
+| `SCHEDULE_AUTO_MIGRATE` | `0` | 多副本同时启动会抢 DDL 锁，schema 交给部署步骤 |
+| `HEALTHCHECK` | 打 `/healthz` | `python:3.12-slim` 里没有 curl |
+
+必须**运行时**传入的：
+
+| ENV | 说明 |
+|---|---|
+| `SCHEDULE_DB_*` | `.env` 不会被打进镜像（里面有密码和 `SCHEDULE_TOKEN`） |
+| `SCHEDULE_PUBLIC_URL` | 客户端实际访问的 HTTPS 地址，也是令牌绑定的 resource id |
+| `SCHEDULE_ALLOWED_HOSTS` / `_ORIGINS` | 默认允许列表由 `PUBLIC_URL` 推导，反代改写 Host 时要显式给 |
+
+连接数 = **副本数 × workers × pool_max**，总量控制在 32 以内；调 worker 前先看
+这个乘积。
+
+生产部署的差别只有两处：前面加一层终止 TLS 的反代（uvicorn 这边没配证书），以及
+把 `ports` 换成内网地址或直接删掉——令牌在 header 里，明文过一次网络就等于泄漏。
+
+## CLI
+
+```bash
+export SCHEDULE_TOKEN=sm_xxx
+schedule-manager whoami
+schedule-manager create --title '团队站会' --priority 3
+schedule-manager list --status pending --sort-by priority
+schedule-manager search --keyword deadline
+```
+
+CLI 与远程 MCP 接受**同一种凭据**，所以一个令牌两边都能用。
+
+### 输出格式
+
+默认 JSON 信封，`--human` 输出人类可读文本，`--describe` 输出机器可读 schema。
+
+```json
+{"status": "ok", "data": {...}}
+{"status": "error", "error": {"code": "NOT_FOUND", "message": "..."}}
+```
+
+### 全局选项
+
+| 选项 | 说明 |
+|---|---|
+| `--token` | Bearer 令牌，回落到 `SCHEDULE_TOKEN` → `SCHEDULE_TOKEN_FILE` |
+| `--human` | 人类可读文本 |
+| `--describe` | JSON Schema 并退出 |
+| `--help` | 帮助 |
+
+### 业务命令
+
+`whoami` / `create` / `get` / `update` / `delete` / `complete` / `list` / `search`
+
+参数同旧版，另加 `--dry-run`（`create` / `update` / `delete` / `complete`）。
+
+### 管理命令
+
+不暴露为 MCP 工具，只走 CLI。
+
+| 命令 | 说明 |
+|---|---|
+| `user open --username X [--scope ...] [--label ...]` | 开户并签发首个令牌（明文打印一次） |
+| `user close --id N` | 停用账户并吊销其全部令牌；日程保留但不可达 |
+| `token issue --id N [--scope ...] [--label ...]` | 追加令牌 |
+| `token revoke --token-id N` | 吊销令牌 |
+| `token list [--id N]` | 列出令牌，只显示摘要前 8 位，**永不显示令牌本身** |
+
+### 退出码
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 1 | 一般错误（含配置问题） |
+| 2 | 参数错误 |
+| 20 | 资源不存在（**含他人的日程**） |
+| 40 | 校验错误 |
+| 41 | 未认证（缺令牌 / 不存在 / 已吊销 / 已过期 / 账户已停用） |
+| 42 | 禁止 |
 
 ## 开发
 
@@ -345,20 +359,58 @@ pip install -e ".[test,dev]"
 pytest tests/ -v
 ```
 
-需要 PostgreSQL 数据库。测试前确保 `.env` 配置正确并已执行 `schedule-manager-setup-db`。
+| 文件 | 需要数据库 | 覆盖 |
+|---|---|---|
+| `test_offline.py` | 否 | 身份上下文、生成 SQL、DDL、校验 |
+| `test_live.py` | 是 | 账户、凭据、CRUD、查询、隔离矩阵 |
+| `test_cli.py` | 是 | 真实子进程：信封、退出码、跨用户拒绝 |
+
+数据库不可达时后两者**跳过**而非失败，`test_offline.py` 任何环境都能跑。
+
+隔离契约优先用生成 SQL 断言（无需连库，直接检查契约而非观察结果）：
+
+```python
+with as_user(7):
+    assert '"user_id" = %s' in Schedule.query().to_sql()[0]
+```
+
+跨用户用例必须断言两半：调用失败**且**目标行未被改动。
+
+`test_cli.py` 较慢（每例约 14s），因为每次子进程调用都要付冷启动导入的代价。
 
 ### 项目结构
 
 ```
 src/schedule_manager/
-├── __init__.py
-├── config.py       # 数据库配置（环境变量优先，回退 .env）
-├── model.py        # Schedule ActiveRecord 模型
-├── schema.py       # schedules 表 DDL（消费 DDLSource 声明）
-├── mcp_server.py   # MCP Server（MCPServer），7 个工具
-├── cli.py          # CLI 入口，LLM 优化设计
-└── setup_db.py     # 数据库表初始化脚本
+├── config.py       # DB / 服务端 / 令牌配置
+├── db.py           # 共享 backend 装配（见下）
+├── errors.py       # 三个领域异常
+├── identity.py     # current_user_id()，身份唯一出口
+├── auth.py         # SDK TokenVerifier 薄适配器
+├── models/         # base.py / user.py / token.py / schedule.py
+├── schema/         # _column.py / users.py / tokens.py / schedules.py
+├── mcp_server.py   # Streamable HTTP
+├── cli.py          # CLI 入口
+└── setup_db.py     # 建表
+
+Dockerfile         # 多阶段构建，运行阶段离线装 wheel
+compose.yaml       # postgres + 一次性建表任务 + 服务
+docker/
+└── build-wheels.sh # 把本地 ORM release 分支打成 wheels/ 里的 wheel
+.dockerignore      # 关键是把 .env 挡在构建上下文外
+wheels/            # build-wheels.sh 的产物，被 .gitignore 忽略
 ```
+
+### 两个容易踩的坑
+
+**`Model.configure()` 是按类生效的。** 每调用一次就新建一个 backend 实例并
+独立建连接。配置四个模型 = 四条连接，于是通过某个模型开启的事务**覆盖不到**
+通过另一个模型发出的语句——它们在不同会话上，互相看不见未提交的数据。
+一律走 `db.connect()`：它配置一个类，再把 backend 分发给其余模型。
+
+**嵌套事务会提前提交。** Postgres backend 只有单连接，事务状态是实例级的，
+内层 `backend.transaction()` 会把外层的工作先提交掉，外层再提交一次。
+`models/user.py` 里的 `transaction()` 辅助函数在已有事务时直接复用，而不是新开。
 
 ## 许可证
 

@@ -1,0 +1,45 @@
+# `.env` holds SCHEDULE_DB_PASSWORD and SCHEDULE_TOKEN.  A file in the build
+# context is a file in the daemon's cache and in every layer that copies it, and
+# `docker push` ships the layers — deleting the file in a later RUN does not help.
+# The image also never reads one (see config.py: the .env fallback resolves to a
+# path inside site-packages that does not exist), so there is nothing to lose.
+.env
+.env.*
+!.env.example
+
+# Everything below is not needed to build the wheel, and keeping it out of the
+# context is what makes the COPY in the Dockerfile safe by construction.
+.git/
+.gitignore
+.github/
+.claude/
+.kilo/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+tests/
+scripts/
+*.crt
+*.pem
+*.key
+AGENTS.md
+CLAUDE.md
+opencode.json
+
+# `*.md` is excluded wholesale, then README.md is put back: pyproject declares
+# `readme = "README.md"`, so the metadata build fails without it.
+*.md
+!README.md
